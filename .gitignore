@@ -2,6 +2,9 @@
 .claude
 .codex
 .codegraph/
+
+# 源码阅读文档的生成断点状态（编排用临时件，非交付物）
+docs/sourceReader/.progress/
 /target
 /build
 /.github/rust-cache/
