@@ -18,7 +18,7 @@
 | 3 | CR 类型实际叫 **`AgentgatewayPolicy` / `AgentgatewayBackend` / `AgentgatewayModel` / `AgentgatewayParameters`**，不是 AIGatewayRoute / Agent / MCPServer | `controller/api/v1alpha1/agentgateway/` 四个 `_types.go`；`collection.go` 建 informer |
 | 4 | xDS server 是一个 **gRPC Delta-ADS**（聚合发现服务，增量推送）服务，默认监听 **9978**，在 `setup.New` 里建 listener、`Start` 里起服务 | `controller/api/settings/settings.go:175` `AgentgatewayXdsServicePort` `default:"9978"`；`newXDSListener` `+0`；`runXDSServer` `+0` |
 | 5 | CR 变更 → 翻译 → 推送的触发点是 `PerGatewayCollection` 注册的 **batch 回调**，它把变更资源名塞进 `pushChannel`，由 DiscoveryServer 防抖后 `GenerateDeltas` 生成增量下发 | `xds.go` `PerGatewayCollection` `+29`；`GenerateDeltas` `+0` |
-| 6 | 数据面收到 xDS 后**热加载**：xDS 客户端把资源写进 store，`watch_resource_changes` 订阅到变化就 `reload_config_after_change`，全程不重启进程 | `state_manager.rs` `watch_resource_changes` `+0`；`reload_config_after_change` `+0` |
+| 6 | 数据面收到 xDS 后**热加载**（真 xDS 模式）：xDS 客户端把资源写进 store 的 `Handler<ADPResource>::handle` → `insert_xds` 发 `BindEvent` → `Gateway::run` 的 `binds.subscribe()` 增删 accept loop，全程不重启进程。**注意** `watch_resource_changes`/`reload_config_*` 那条**不是** xDS 路径，而是 LocalClient（本地文件/inline config，测试用）路径 | `state_manager.rs` · `impl StateManager · run +116`（`Some(xds) => xds.run()`）；`store/binds.rs` · `Handler<ADPResource>::handle +2367`、`insert_xds +1937`（→ `insert_xds_bind` 发 `BindEvent`，`+942`）；`proxy/gateway.rs` · `Gateway::run +184`（`binds.subscribe()` `+191`） |
 | 7 | 数据面拒绝配置会 **NACK**（拒绝确认），控制面把它转成 Kubernetes Event 写回 CR，形成闭环 | `shouldRespondDelta` `+0`；`nack/publisher.go` `PublishNack` `+0` |
 
 ### 0.3 不做什么
@@ -153,7 +153,8 @@ spec:
 | xDS 集合 | krtxds | `AgwResource` → 按网关分组的 DiscoveryResource → 推送 | `controller/pkg/syncer/krtxds/xds.go` |
 | xDS server | gRPC Delta-ADS | 监听 9978、认证、下发 | `controller/pkg/setup/controlplane.go` |
 | 数据面拉取 | Rust `agent-xds` | ADS 客户端、注册 watched handler | `crates/xds/src/client.rs`、`crates/agentgateway/src/state_manager.rs` |
-| 数据面热加载 | Rust state_manager | 变化触发 reload | `crates/agentgateway/src/state_manager.rs` |
+| 数据面热加载（xDS 模式） | Rust `agent-xds` + store binds Handler | `xds.run()` 收增量 → `Handler<ADPResource>::handle` 写 store → `insert_xds` 发 `BindEvent` → `Gateway::run` 的 `binds.subscribe()` 增删 accept loop | `crates/agentgateway/src/state_manager.rs` · `impl StateManager · run +116`；`crates/agentgateway/src/store/binds.rs` · `Handler::handle +2367`/`insert_xds +1937`；`crates/agentgateway/src/proxy/gateway.rs` · `Gateway::run +184` |
+| 数据面热加载（LocalClient 测试路径，非 xDS） | Rust state_manager `LocalClient` | 本地文件/inline config 变化触发 reload（`state_manager.rs:124` 注释自称 "a local file reader alternative for XDS... intended for testing"） | `crates/agentgateway/src/state_manager.rs` · `LocalClient · run +139`/`watch_resource_changes +212`/`reload_config_after_change +308`/`reload_config +247` |
 
 ### 2.2 真实调用链
 
@@ -196,9 +197,12 @@ API Server 事件
       → pushDeltaXds(...) xds.go +0
           → 经 gRPC 流发给数据面
   → 数据面 AdsClient 收到 (client.rs · AdsClient / with_watched_handler +0)
-      → 写入 stores.binds (state_manager.rs · Config::new +50..+56)
-      → watch_resource_changes 订阅到 changed (state_manager.rs +0)
-          → reload_config_after_change (+0) → reload_config (+0)     ← 热加载
+      → xDS store 写入回调 Handler<ADPResource>::handle (store/binds.rs +2367)
+          → insert_xds (+1937) → insert_xds_bind 发 BindEvent (+942)
+              → Gateway::run 的 binds.subscribe() 增删 accept loop (proxy/gateway.rs +184)   ← xDS 模式热加载
+      〔非 xDS〕LocalClient 测试路径：watch_resource_changes (state_manager.rs +212) 订阅到 changed
+          → reload_config_after_change (+308) → reload_config (+247)
+            （仅本地文件/inline config 用，见 state_manager.rs:124 注释）
 ```
 
 ### 2.3 源码映射表（每个生产步骤 → 真实锚点）
@@ -219,8 +223,8 @@ API Server 事件
 | 防抖 | `controller/pkg/syncer/krtxds/xds.go` · `debounce` / `DebounceAfter` | `debounce +0`（`:1059`）；`DebounceAfter +0`（`:201`） | 默认 10ms，env `KGW_DEBOUNCE_AFTER` |
 | 生成增量资源 | `controller/pkg/syncer/krtxds/xds.go` · `CollectionGenerator.GenerateDeltas` | `+0` | 按 `IsForGateway(gw)` 过滤 |
 | 起 xDS gRPC server | `controller/pkg/setup/controlplane.go` · `runXDSServer` | `+0`；`Serve(lis)` `+25`（`:81`） | 注册 `AggregatedDiscoveryServiceServer` |
-| 建数据面 xDS 客户端 | `crates/agentgateway/src/state_manager.rs` · `Config::new(...).with_watched_handler::<ADPResource>(...)` | `Config::new +0`（`:69`）；`with_watched_handler +50`/`+51`（`:74`/`:75`） | 监听 ADDRESS_TYPE 和 ADP_TYPE |
-| 数据面热加载 | `crates/agentgateway/src/state_manager.rs` · `watch_resource_changes` → `reload_config_after_change` → `reload_config` | `+0` / `+0` / `+0` | tokio 任务订阅 `subscribe_changes()` |
+| 建数据面 xDS 客户端 | `crates/agentgateway/src/state_manager.rs` · `Config::new(...).with_watched_handler::<ADPResource>(...)` | `Config::new +0`（`:69`）；`with_watched_handler +50`/`+51`（`:74`/`:75`） | 监听 ADDRESS_TYPE 和 ADP_TYPE。`with_watched_handler` 注册的 store 写入回调**两种模式都有**；但 `watch_resource_changes`/`reload_config_*` 只在 LocalClient 路径 |
+| 数据面热加载（LocalClient 测试路径，非 xDS） | `crates/agentgateway/src/state_manager.rs` · `LocalClient` · `watch_resource_changes` → `reload_config_after_change` → `reload_config` | `+212` / `+308` / `+247` | tokio 任务订阅 `subscribe_changes()`。**仅本地文件/inline config 用**；真 xDS 模式热加载走 binds Handler/BindEvent，不经这三个函数 |
 | NACK 反馈 | `controller/pkg/syncer/krtxds/xds.go` · `shouldRespondDelta` | `+0`；`PublishNack` 调用 `+47`（`:602`） | |
 | NACK 写 K8s Event | `controller/pkg/syncer/nack/publisher.go` · `PublishNack` | `+0` | Reason = `AgentGatewayNackError`（`:23`） |
 | Gateway 自身的 reconcile（拉数据面 Deployment） | `controller/pkg/controller/gw_controller.go` · `gatewayReconciler.Reconcile` | `+0` | 与配置翻译链**独立**，只管 Deployment/Service/状态 |
@@ -239,7 +243,8 @@ sequenceDiagram
     participant DS as xds.go·DiscoveryServer/GenerateDeltas
     participant XDS as controlplane.go·runXDSServer(:9978)
     participant ADS as state_manager.rs·AdsClient
-    participant ST as state_manager.rs·reload_config_after_change
+    participant BND as binds.rs·Handler<ADPResource>::handle/insert_xds
+    participant GW as gateway.rs·Gateway::run·binds.subscribe()
 
     OPS->>API: apply AgentgatewayPolicy
     API->>INF: informer 事件
@@ -252,10 +257,12 @@ sequenceDiagram
     DS->>DS: GenerateDeltas(按 gateway 过滤)
     DS->>XDS: DeltaDiscoveryResponse
     XDS-->>ADS: gRPC 流下发资源
-    ADS->>ADS: 写入 stores.binds
-    ADS->>ST: resource_changes.changed()
-    ST->>ST: reload_config → 新转发规则生效
-    Note over ST: 数据面拒绝时：ADS 回 NACK<br/>DS·shouldRespondDelta → nack.Publisher.PublishNack<br/>→ 写 Gateway K8s Event
+    ADS->>ADS: with_watched_handler 注册的 store 写入回调
+    ADS->>BND: Handler<ADPResource>::handle (binds.rs +2367)
+    BND->>BND: insert_xds (+1937) → 发 BindEvent
+    BND->>GW: binds.subscribe() 增删 accept loop → 新转发规则生效
+    Note over BND,GW: 真 xDS 模式热加载；reload_config_* 那条属 LocalClient（本地文件/inline，测试用）路径
+    Note over ADS: 数据面拒绝时：ADS 回 NACK<br/>DS·shouldRespondDelta → nack.Publisher.PublishNack<br/>→ 写 Gateway K8s Event
 ```
 
 ### 2.5 分支、失败处理与必须保持的规则
@@ -296,17 +303,17 @@ sequenceDiagram
 
 本篇所有锚点均在当前工作区（`adrian@47ea6aa0`，干净）定点读取核实：
 
-- 已读并确认：`setup.go`（`New`/`Start`/`newXDSListener`/`buildSyncer`）、`controlplane.go`（`runXDSServer`/`getGRPCServerOpts`）、`collection.go`（`NewAgwCollections` 的三个 agentgateway informer）、`syncer.go`（`NewAgwSyncer`/`buildResourceCollections`/`buildAgwResources`/`buildXDSCollection`/`Start`）、`krtxds/xds.go`（`PerGatewayCollection`/`Collection`/`GenerateDeltas`/`shouldRespondDelta`/`DebounceAfter`）、`gw_controller.go`（`Reconcile`）、`traffic_plugin.go`（`NewAgentPlugin`/`TranslateAgentgatewayPolicy`）、`nack/publisher.go`（`PublishNack`/`ReasonNack`）、`settings.go`（`AgentgatewayXdsServicePort` default 9978）、`crates/agentgateway-app/src/lib.rs`（`run`/`read_config_contents`/`running_in_kubernetes`）、`crates/agentgateway/src/state_manager.rs`（`watch_resource_changes`/`reload_config`/`reload_config_after_change`/`Config::new`）。
+- 已读并确认：`setup.go`（`New`/`Start`/`newXDSListener`/`buildSyncer`）、`controlplane.go`（`runXDSServer`/`getGRPCServerOpts`）、`collection.go`（`NewAgwCollections` 的三个 agentgateway informer）、`syncer.go`（`NewAgwSyncer`/`buildResourceCollections`/`buildAgwResources`/`buildXDSCollection`/`Start`）、`krtxds/xds.go`（`PerGatewayCollection`/`Collection`/`GenerateDeltas`/`shouldRespondDelta`/`DebounceAfter`）、`gw_controller.go`（`Reconcile`）、`traffic_plugin.go`（`NewAgentPlugin`/`TranslateAgentgatewayPolicy`）、`nack/publisher.go`（`PublishNack`/`ReasonNack`）、`settings.go`（`AgentgatewayXdsServicePort` default 9978）、`crates/agentgateway-app/src/lib.rs`（`run`/`read_config_contents`/`running_in_kubernetes`）、`crates/agentgateway/src/state_manager.rs`（`watch_resource_changes`/`reload_config`/`reload_config_after_change`/`Config::new`；其中前三个属 **LocalClient 测试路径**，非真 xDS 热加载主路径，见 §0.2 结论 6）、`crates/agentgateway/src/store/binds.rs`（`Handler<ADPResource>::handle +2367`/`insert_xds +1937`）、`crates/agentgateway/src/proxy/gateway.rs`（`Gateway::run +184`/`binds.subscribe +191`）。
 - 示例 CR 的 `AgentgatewayPolicy` 段照抄 `examples/traffic-backend-mtls-files/policy.yaml`。
 
 ### 3.2 已知缺口与未确认项
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| `main.go`/cobra 命令的精确偏移 | `[源码未确认]` | 本篇未定点读 `controller/cmd/agentgateway/main.go` 的行号，仅在 `01` 篇已核实入口形态；写锚点时如需精确偏移要单独核 |
-| 数据面把 xDS 资源真正转成转发规则的完整内部 | `[源码未确认]` | 本篇只核到 `reload_config`/`reload_config_after_change` 入口；`NormalizedLocalConfig::from_expanded` 之后的转换细节属 `02`/`03` 篇范围 |
+| `main.go`/cobra 命令的精确偏移 | 已核实 | `controller/cmd/agentgateway/main.go` 共 40 行：`main +0`（`func main()`）；cobra 命令定义 `cmd := &cobra.Command{...}` 在 `+1`~`+21`（`Use: "agentgateway"` 在 `+3`）；`RunE` 闭包在 `+6`~`+19`，其中 `--version`/`-v` 分支 `+7`~`+9`、`setup.New` 在 `+11`、`s.Start(cmd.Context())` 在 `+14`；`--version` flag 注册 `cmd.Flags().BoolVarP` 在 `+22`；`cmd.Execute()` 失败走 `log.Fatal(err)` 在 `+24`~`+26` |
+| 数据面把配置真正转成转发规则的完整内部 | 代码已确认 | 以下 `reload_config` 链属 **LocalClient（本地文件/inline，测试用）路径**，非真 xDS 热加载主路径（xDS 模式热加载走 binds Handler/BindEvent，见 §0.2 结论 6）。`reload_config`（`state_manager.rs · LocalClient · reload_config +247`）以 `ResourceFetcher::managed`（`resource_manager.rs +152`）取 xDS 资源字节 + `config_content()` 展开后的本地 YAML，交给 `NormalizedLocalConfig::from_expanded`（`types/local.rs · from_expanded +96`）：`with_parse_fetcher` 包裹 `serdes::yaml::from_str` 先解析成中间结构 **`LocalConfig`**，再 `convert`（`+3296`）校验+默认值+废弃字段迁移后分派 `convert_gateways`/`convert_listener`/`convert_route`/`convert_llm_config`/`convert_mcp_config`/`convert_tcp_route` 等子转换，产出最终配置 **`NormalizedLocalConfig`**（`binds`/`listener_routes`/`listener_tcp_routes`/`policies`/`backends`/`route_groups`/`workloads`/`services`/`budget_registration`/`model_catalog`）；随后 `reload_config` 把它 `sync_local` 进 binds/discovery store 并 `budget_policy.apply_registration`。详见 `05` 篇 §4.4 同项；`convert_*` 各子转换的字段级映射未逐行展开 |
 | 端到端时延 | `[待运行验证]` | 防抖默认 10ms（`DebounceAfter`），但 apply 到流量生效的实际时延未在真实集群测量 |
-| `AgentgatewayBackend.spec` 完整字段 | `[源码未确认]` | 示例中的 `spec.ai.llm` 为脱敏示意，未逐字段核对 `agentgateway_backend_types.go` |
+| `AgentgatewayBackend.spec` 完整字段 | 已核实 | `controller/api/v1alpha1/agentgateway/agentgateway_backend_types.go`：`AgentgatewayBackendSpec +0`（func/struct 签名行）；`AgentgatewayBackend +0` 的 `Spec` 字段在 `+9`（`+required`）。`spec` 共 7 个字段，**全部 `+optional` 指针**：`Static *StaticBackend`（`static`，`+3`）、`A2A *A2ABackend`（`a2a`，`+7`）、`AI *AIBackend`（`ai`，`+11`）、`MCP *MCPBackend`（`mcp`，`+15`）、`DynamicForwardProxy *DynamicForwardProxyBackend`（`dynamicForwardProxy`，`+23`）、`Aws *AwsBackend`（`aws`，`+27`）、`Policies *BackendFull`（`policies`，`+33`）。spec 结构体上有 `ExactlyOneOf=ai;static;dynamicForwardProxy;mcp;aws;a2a` 校验（定义在 struct 前 3 行，`agentgateway_backend_types.go:55`），另有两条 XValidation：AI policies 需 `ai`、MCP policies 需 `mcp`（`:56`~`:57`）。示例里 `spec.ai.llm` 之外的嵌套子结构（`AIBackend`/`MCPBackend` 等）本篇未逐层展开 |
 | 是否存在名为 `AIGatewayRoute`/`Agent`/`MCPServer` 的 CRD | `[源码未找到]` | 已 grep `controller/api/v1alpha1`，实际类型为 `Agentgateway{Policy,Backend,Model,Parameters}`；任务描述里的 `AIGatewayRoute/Agent/MCPServer` 在本仓库不存在 |
 
 ### 3.3 修改联动清单
@@ -337,4 +344,6 @@ sequenceDiagram
 | `controller/pkg/controller/gw_controller.go` | `gatewayReconciler.Reconcile` | 284 |
 | `controller/pkg/syncer/nack/publisher.go` | `ReasonNack` / `PublishNack` | 23 / 63 |
 | `crates/agentgateway-app/src/lib.rs` | `run` / `read_config_contents` | 141 / 172 |
-| `crates/agentgateway/src/state_manager.rs` | `watch_resource_changes` / `reload_config` / `reload_config_after_change` | 212 / 247 / 308 |
+| `crates/agentgateway/src/state_manager.rs` | `watch_resource_changes` / `reload_config` / `reload_config_after_change`（三者均属 **LocalClient 本地文件/inline 测试路径**，非真 xDS 热加载主路径） | 212 / 247 / 308 |
+| `crates/agentgateway/src/store/binds.rs` | `Handler<ADPResource>::handle` / `insert_xds`（真 xDS 模式热加载落点） | 2367 / 1937 |
+| `crates/agentgateway/src/proxy/gateway.rs` | `Gateway::run`（`binds.subscribe()` 在 +191） | 185 |

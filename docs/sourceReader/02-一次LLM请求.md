@@ -211,7 +211,7 @@ sequenceDiagram
 | 一次真实请求的端到端时延、上游实际返回内容 | `[待运行验证]` | 本篇未起服务实测，仅静态核读 |
 | 非流式响应是否也强制带 usage 字段 | 代码已确认仅**流式**补 `include_usage`（`+1818~+1826`）；非流式行为未逐行核到 |  |
 | remote rate limit / budget 的持久化后端（sqlite/postgres）具体表结构 | 本篇未展开 | 见 `crates/agentgateway/src/http/budget/`（`sqlite_schema.sql`、`postgres_migrations/`） |
-| `xds` 控制面下发的 `Failover` 路由（`types/agent_xds.rs +1998`）与本地配置路径的等价性 | `[推断]` | 两者都产出 `VirtualModelRouting::Failover`，但 xds 侧 `targets` 为空、只带 `backend` 引用，行为差异未逐行比对 |
+| `xds` 控制面下发的 `Failover` 路由（`types/agent_xds.rs +1998`）与本地配置路径的等价性 | 代码已确认：请求解析等价，模型列表行为不等价 | 两者都产出 `VirtualModelRouting::Failover { backend, targets }`。**请求时解析等价**：`resolve_virtual_model +647` 的 Failover 分支只读 `backend`（`..` 忽略 `targets`），直接 `return ResolveResult::Backend`，xds 侧 `targets: vec![]` 不影响路由。**`backend` 来源不同**：xds 侧 `resolve_reference(failover.backend)`（`agent_xds.rs +2002` → `resolve_reference +4519`）产出 `Service`/`Backend`/`InlineBackend`，缺 kind/port=0/空 hostname 时为 `BackendReference::Invalid`；本地侧由 `convert_llm_config`（`local.rs +5251~+5273`）现造一个 `llm:virtual-model:{name}:{idx}` 的合成 `Backend::AI`，`target` 指向该合成 key。**模型列表不等价**：本地侧 `targets` 填入按 `priority` 排序的模型名（`+5267~+5272`），`virtual_model_info +596` 据此聚合出虚拟模型可解析的目标模型列表；xds 侧 `targets` 恒为空，`GET /v1/models` 上该虚拟模型不会列出具体目标模型 |
 
 ### 源码索引（便于跳转复核）
 
