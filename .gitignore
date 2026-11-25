@@ -1,6 +1,7 @@
 .cursor
 .claude
 .codex
+.codegraph/
 /target
 /build
 /.github/rust-cache/
